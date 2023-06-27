@@ -1,5 +1,8 @@
 #![warn(clippy::pedantic)]
-#![allow(clippy::uninlined_format_args)]
+#![allow(
+    clippy::manual_let_else, // rust-lang/rustfmt#4914
+    clippy::uninlined_format_args, // rust-lang/rust-analyzer#11260
+)]
 
 mod input;
 mod plan;
@@ -8,6 +11,7 @@ mod step;
 use anyhow::{bail, Context, Result};
 use camino::Utf8PathBuf;
 use reqwest::Client;
+use std::process::ExitCode;
 use std::str::FromStr;
 
 const POOL: &str = "rpool";
@@ -15,7 +19,7 @@ const OUR_DATASET: &str = "rpool/buildomat-at-home";
 const JOB_NAME_PROPERTY: &str = "computer.oxide.eng.buildomat-at-home:job_name";
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<ExitCode> {
     let client = Client::builder()
         .user_agent("https://github.com/oxidecomputer/buildomat-at-home")
         .build()?;
@@ -35,9 +39,10 @@ async fn main() -> Result<()> {
     inputs.sort_unstable();
 
     let plan = plan::Plan::build(&client, &script, &inputs).await?;
-    if plan.approve()? {
+    Ok(if plan.approve()? {
         plan.run(&client).await?;
-    }
-
-    Ok(())
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }

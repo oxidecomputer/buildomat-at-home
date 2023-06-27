@@ -6,12 +6,13 @@ use futures_util::stream::{self, StreamExt, TryStreamExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::Client;
 use std::ffi::OsStr;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use tempfile::NamedTempFile;
 use tokio::io::AsyncWriteExt;
 
 #[derive(Debug)]
 pub(crate) enum Step {
+    Comment(String),
     CreateDataset {
         dataset: String,
         // `None` here means to inherit the mountpoint property
@@ -59,6 +60,7 @@ impl Step {
         }
 
         match self {
+            Step::Comment(_) | Step::DownloadArtefacts(_) => Vec::new(),
             Step::CreateDataset {
                 dataset,
                 mountpoint,
@@ -86,7 +88,6 @@ impl Step {
                 commands
             }
             Step::DestroyDataset { dataset } => vec![zfs!["destroy", dataset]],
-            Step::DownloadArtefacts(_) => Vec::new(),
             Step::InheritDatasetMountpoint { dataset } => {
                 vec![zfs!["inherit", "mountpoint", dataset]]
             }
@@ -95,6 +96,7 @@ impl Step {
                 command.arg(script);
                 command.env_clear();
                 command.current_dir(workdir);
+                command.stdin(Stdio::null());
                 vec![command]
             }
             Step::SaveWorkAsInput {
@@ -129,8 +131,11 @@ impl Step {
 
     pub(crate) fn commands_for_approval(&self) -> Vec<String> {
         match self {
-            Step::DownloadArtefacts(v) => {
-                vec![format!("### download {} artefacts to /input", v.len())]
+            Step::Comment(comment) => {
+                vec![style(format!("### {}", comment))
+                    .cyan()
+                    .italic()
+                    .to_string()]
             }
             _ => self
                 .commands()
@@ -151,7 +156,7 @@ impl Step {
             let progress_meta = progress.add(
                 ProgressBar::new_spinner().with_style(
                     ProgressStyle::with_template(
-                        "{elapsed} {wide_msg} total: {total_bytes} ({bytes_per_sec})",
+                        "[{elapsed_precise}] {wide_msg} total: {total_bytes} ({bytes_per_sec})",
                     )
                     .unwrap(),
                 ),

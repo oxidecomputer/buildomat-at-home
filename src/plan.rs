@@ -1,13 +1,13 @@
 use crate::input::Input;
 use crate::step::{DownloadArtefact, Step};
 use crate::{JOB_NAME_PROPERTY, OUR_DATASET, POOL};
-use anyhow::{ensure, Context, Result};
-use camino::Utf8Path;
+use anyhow::{bail, ensure, Context, Result};
+use camino::{Utf8Path, Utf8PathBuf};
 use comrak::{nodes::NodeValue, Arena, ComrakOptions};
 use dialoguer::Confirm;
 use reqwest::Client;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::{Command, Stdio};
 use ulid::Ulid;
 
@@ -22,6 +22,7 @@ impl Plan {
         inputs: &[Input],
     ) -> Result<Plan> {
         let frontmatter = FrontMatter::from_job(script)?;
+
         // Jobs are found in `.github/buildomat/jobs/whatever.sh`; remove that to
         // get the working directory.
         let workdir = script
@@ -39,7 +40,8 @@ impl Plan {
             ) == script.parent(),
             "script path not within `.github/buildomat/jobs`"
         );
-        let chown = ["-u", "-g"]
+
+        let chown = ["-un", "-gn"]
             .into_iter()
             .map(|arg| {
                 let output = Command::new("id").arg(arg).output()?;
@@ -49,9 +51,32 @@ impl Plan {
             .collect::<Result<Vec<_>>>()?
             .join(":");
 
-        // Phase 1: Set up rpool/{buildomat-at-home,input,work}
         let mut plan = Vec::new();
-        if !dataset_exists(OUR_DATASET)? {
+
+        // Phase 1: Set up rpool/{buildomat-at-home,input,work}
+
+        let mut mounted: HashMap<String, Utf8PathBuf> = HashMap::new();
+        if dataset_exists(OUR_DATASET)? {
+            let output = Command::new("zfs")
+                .args(["list", "-H", "-o", "name,mountpoint", "-r", OUR_DATASET])
+                .stderr(Stdio::inherit())
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "`zfs list -r {}` failed with {}",
+                OUR_DATASET,
+                output.status
+            );
+            let output = String::from_utf8(output.stdout)?;
+            for line in output.lines() {
+                if let Some((dataset, mountpoint)) = line.split_once('\t') {
+                    if mountpoint.starts_with("/input") {
+                        mounted.insert(dataset.into(), mountpoint.into());
+                    }
+                }
+            }
+        } else {
+            plan.push(Step::Comment("create rpool/buildomat-at-home".into()));
             plan.push(Step::CreateDataset {
                 dataset: OUR_DATASET.into(),
                 mountpoint: None,
@@ -59,8 +84,10 @@ impl Plan {
                 chown: chown.clone(),
             });
         }
+
         let input = format!("{}/input", POOL);
         if !dataset_exists(&input)? {
+            plan.push(Step::Comment("create rpool/input (at /input)".into()));
             plan.push(Step::CreateDataset {
                 dataset: input,
                 mountpoint: Some("/input".into()),
@@ -68,11 +95,15 @@ impl Plan {
                 chown: chown.clone(),
             });
         }
+
         let work = format!("{}/work", POOL);
         if dataset_exists(&work)? {
+            plan.push(Step::Comment("recreate rpool/work (at /work)".into()));
             plan.push(Step::DestroyDataset {
                 dataset: work.clone(),
             });
+        } else {
+            plan.push(Step::Comment("create rpool/work (at /work)".into()));
         }
         plan.push(Step::CreateDataset {
             dataset: work.clone(),
@@ -81,43 +112,23 @@ impl Plan {
             chown: chown.clone(),
         });
 
-        // Phase 2: Remove any of our mounts out from /input
-        let output = Command::new("zfs")
-            .args(["list", "-H", "-o", "name,mountpoint", "-r", OUR_DATASET])
-            .stderr(Stdio::inherit())
-            .output()?;
-        ensure!(
-            output.status.success(),
-            "`zfs list -r {}` failed",
-            OUR_DATASET
-        );
-        let output = String::from_utf8(output.stdout)?;
-        for line in output.lines() {
-            if let Some((dataset, mountpoint)) = line.split_once('\t') {
-                if mountpoint.starts_with("/input") {
-                    plan.push(Step::InheritDatasetMountpoint {
-                        dataset: dataset.into(),
-                    });
-                }
-            }
-        }
+        // Phase 2: Set up input mounts and download artifacts
 
-        // Phase 3: Set up input mounts and download artifacts
-        // FIXME: error if there's not enough inputs
-        // FIXME: delete any existing snapshots that are not set readonly, as they may have failed from previous runs
-        let mut pre_download_phase = Vec::new();
-        let mut post_download_phase = Vec::new();
+        let mut unmatched = frontmatter.dependencies.keys().collect::<HashSet<_>>();
+        let mut cleanup_phase = Vec::new();
+        let mut mount_phase = Vec::new();
+        let mut readonly_phase = Vec::new();
         let mut downloads = Vec::new();
         for input in inputs {
             let dataset = format!("{}/{}", OUR_DATASET, input);
             let mut check = None;
             let job_name = match input {
                 Input::LocalBuild { .. } => {
-                    let output = Command::new("zfs")
-                        .args(["get", "-H", "-o", "value", JOB_NAME_PROPERTY, &dataset])
-                        .output()?;
-                    ensure!(output.status.success(), "input {} not found", input);
-                    String::from_utf8(output.stdout)?
+                    if let Some(job_name) = dataset_prop(&dataset, JOB_NAME_PROPERTY)? {
+                        job_name
+                    } else {
+                        bail!("input {} not found", input);
+                    }
                 }
                 Input::GitHubRun {
                     owner,
@@ -134,49 +145,103 @@ impl Plan {
                     name
                 }
             };
-            let Some((k, _)) = frontmatter
-            .dependencies
-            .iter()
-            .find(|(_, v)| v.job == job_name)
-        else {
-            continue;
-        };
+
+            let k = if let Some((k, _)) = frontmatter
+                .dependencies
+                .iter()
+                .find(|(_, v)| v.job == job_name)
+            {
+                unmatched.remove(k);
+                k
+            } else {
+                bail!("{} is not an input to this job", input);
+            };
+
             let mountpoint = Utf8Path::new("/input").join(k);
             if let Some(check) = check {
                 if dataset_exists(&dataset)? {
-                    pre_download_phase.push(Step::SetDatasetMountpoint {
-                        dataset: dataset.clone(),
-                        mountpoint,
-                    });
-                } else {
-                    for (path, url) in check.artefacts() {
-                        downloads.push(DownloadArtefact {
-                            path: format!("{}{}", mountpoint, path).into(),
-                            url,
+                    // If `readonly=off`, a previous run was most likely interrupted (since we set
+                    // `readonly=on`) after successfully downloading everything.
+                    if dataset_prop(&dataset, "readonly")?.as_deref() == Some("off") {
+                        mounted.remove(&dataset);
+                        cleanup_phase.push(Step::DestroyDataset {
+                            dataset: dataset.clone(),
                         });
+                    } else {
+                        // The input dataset exists and looks fine. Adjust the mountpoint if needed,
+                        // but otherwise continue as we do not need to download these artefacts.
+                        if mounted.get(&dataset) == Some(&mountpoint) {
+                            mounted.remove(&dataset);
+                        } else {
+                            mount_phase.push(Step::SetDatasetMountpoint {
+                                dataset: dataset.clone(),
+                                mountpoint,
+                            });
+                        }
+                        continue;
                     }
-                    pre_download_phase.push(Step::CreateDataset {
-                        dataset: dataset.clone(),
-                        mountpoint: Some(mountpoint),
-                        create_parents: true,
-                        chown: chown.clone(),
-                    });
-                    post_download_phase.push(Step::SetDatasetReadOnly { dataset });
                 }
+
+                for (path, url) in check.artefacts() {
+                    downloads.push(DownloadArtefact {
+                        path: format!("{}{}", mountpoint, path).into(),
+                        url,
+                    });
+                }
+                mount_phase.push(Step::CreateDataset {
+                    dataset: dataset.clone(),
+                    mountpoint: Some(mountpoint),
+                    create_parents: true,
+                    chown: chown.clone(),
+                });
+                readonly_phase.push(Step::SetDatasetReadOnly { dataset });
             }
         }
-        plan.extend(pre_download_phase);
-        plan.push(Step::DownloadArtefacts(downloads));
-        plan.extend(post_download_phase);
+        ensure!(
+            unmatched.is_empty(),
+            "inputs {:?} are required but not provided",
+            unmatched
+        );
+        if !mounted.is_empty() {
+            plan.push(Step::Comment(
+                "remove inputs from a previous job from /input".into(),
+            ));
+            for (dataset, _) in mounted {
+                plan.push(Step::InheritDatasetMountpoint { dataset });
+            }
+        }
+        if !cleanup_phase.is_empty() {
+            plan.push(Step::Comment("remove incomplete /input datasets".into()));
+            plan.extend(cleanup_phase);
+        }
+        if !mount_phase.is_empty() {
+            plan.push(Step::Comment("set up datasets for /input".into()));
+            plan.extend(mount_phase);
+        }
+        if !downloads.is_empty() {
+            plan.push(Step::Comment(format!(
+                "download {} artifacts",
+                downloads.len()
+            )));
+            plan.push(Step::DownloadArtefacts(downloads));
+        }
+        if !readonly_phase.is_empty() {
+            plan.push(Step::Comment("mark /input datasets read-only".into()));
+            plan.extend(readonly_phase);
+        }
 
-        // Step 4: Run the dang script.
+        // Phase 3: Run the dang script
+
+        plan.push(Step::Comment("run job script".into()));
         plan.push(Step::RunScript {
             script: script.to_owned(),
             workdir,
         });
 
-        // Step 5: Clone and promote /work
+        // Phase 4: Clone and promote /work
+
         let input = Input::LocalBuild { id: Ulid::new() };
+        plan.push(Step::Comment(format!("save /work as {}", input)));
         plan.push(Step::SaveWorkAsInput {
             work_dataset: work,
             new_dataset: format!("{}/{}", OUR_DATASET, input),
@@ -211,6 +276,17 @@ fn dataset_exists(dataset: &str) -> Result<bool> {
         .output()?
         .status
         .success())
+}
+
+fn dataset_prop(dataset: &str, property: &str) -> Result<Option<String>> {
+    let output = Command::new("zfs")
+        .args(["get", "-H", "-o", "value", property, dataset])
+        .output()?;
+    Ok(if output.status.success() {
+        Some(std::str::from_utf8(&output.stdout)?.trim().to_owned())
+    } else {
+        None
+    })
 }
 
 #[derive(Debug, Deserialize)]
