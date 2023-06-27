@@ -116,9 +116,10 @@ impl Step {
                 command.current_dir(workdir);
                 command.stdin(Stdio::null());
 
-                // https://github.com/oxidecomputer/buildomat/blob/4ae0dc9fc1e6e300bba9f959ce264aad2754cdbd/github/server/src/variety/basic.rs#L689
                 command.env_clear();
-                for var in ["HOME", "USER", "LOGNAME"] {
+                // https://github.com/oxidecomputer/buildomat/blob/4ae0dc9fc1e6e300bba9f959ce264aad2754cdbd/github/server/src/variety/basic.rs#L689
+                // TERM added for nicer output of cargo etc
+                for var in ["HOME", "USER", "LOGNAME", "TERM"] {
                     if let Some(value) = std::env::var_os(var) {
                         command.env(var, value);
                     }
