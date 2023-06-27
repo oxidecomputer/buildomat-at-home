@@ -1,3 +1,4 @@
+use crate::command::CommandExt;
 use crate::input::Input;
 use crate::step::{DownloadArtefact, Step};
 use crate::{JOB_NAME_PROPERTY, OUR_DATASET, POOL};
@@ -8,7 +9,7 @@ use dialoguer::Confirm;
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use ulid::Ulid;
 
 #[derive(Debug)]
@@ -24,16 +25,15 @@ impl Plan {
         let frontmatter = FrontMatter::from_job(script)?;
 
         // Jobs are found in `.github/buildomat/jobs/whatever.sh`; remove that to
-        // get the working directory.
-        let workdir = script
+        // get the root of the repository.
+        let repo = script
             .ancestors()
             .nth(4)
             .context("failed to determine work dir")?
             .to_owned();
         ensure!(
             Some(
-                workdir
-                    .join(".github")
+                repo.join(".github")
                     .join("buildomat")
                     .join("jobs")
                     .as_path()
@@ -43,11 +43,7 @@ impl Plan {
 
         let chown = ["-un", "-gn"]
             .into_iter()
-            .map(|arg| {
-                let output = Command::new("id").arg(arg).output()?;
-                ensure!(output.status.success(), "`id {}` failed", arg);
-                Ok(std::str::from_utf8(&output.stdout)?.trim().to_owned())
-            })
+            .map(|arg| trim_stdout(&Command::new("id").arg(arg).succeed_output()?))
             .collect::<Result<Vec<_>>>()?
             .join(":");
 
@@ -60,15 +56,8 @@ impl Plan {
             let output = Command::new("zfs")
                 .args(["list", "-H", "-o", "name,mountpoint", "-r", OUR_DATASET])
                 .stderr(Stdio::inherit())
-                .output()?;
-            ensure!(
-                output.status.success(),
-                "`zfs list -r {}` failed with {}",
-                OUR_DATASET,
-                output.status
-            );
-            let output = String::from_utf8(output.stdout)?;
-            for line in output.lines() {
+                .succeed_output()?;
+            for line in trim_stdout(&output)?.lines() {
                 if let Some((dataset, mountpoint)) = line.split_once('\t') {
                     if mountpoint.starts_with("/input") {
                         mounted.insert(dataset.into(), mountpoint.into());
@@ -230,7 +219,50 @@ impl Plan {
             plan.extend(readonly_phase);
         }
 
-        // Phase 3: Run the dang script
+        // Phase 3.1: Clone the repository
+
+        let workdir = if frontmatter.skip_clone {
+            Utf8PathBuf::from("/work")
+        } else {
+            let mut treeish = trim_stdout(
+                &Command::new("git")
+                    .args(["stash", "create"])
+                    .current_dir(&repo)
+                    .succeed_output()?,
+            )?;
+            if treeish.is_empty() {
+                treeish = trim_stdout(
+                    &Command::new("git")
+                        .args(["rev-parse", "HEAD"])
+                        .current_dir(&repo)
+                        .succeed_output()?,
+                )?;
+            }
+
+            let remote = trim_stdout(
+                &Command::new("git")
+                    .args(["remote", "get-url", "origin"])
+                    .current_dir(&repo)
+                    .output()?,
+            )?;
+            let mut iter = remote.rsplit(['/', ':']);
+            let dest = if let (Some(mut repo), Some(owner)) = (iter.next(), iter.next()) {
+                repo = repo.strip_suffix(".git").unwrap_or(repo);
+                Utf8Path::new("/work").join(owner).join(repo)
+            } else {
+                Utf8PathBuf::from("/work")
+            };
+
+            plan.push(Step::Comment("clone repository into /work".into()));
+            plan.push(Step::CloneRepo {
+                src: repo,
+                treeish,
+                dest: dest.clone(),
+            });
+            dest
+        };
+
+        // Phase 3.2: Run the dang script
 
         plan.push(Step::Comment("run job script".into()));
         plan.push(Step::RunScript {
@@ -270,6 +302,10 @@ impl Plan {
     }
 }
 
+fn trim_stdout(output: &Output) -> Result<String> {
+    Ok(std::str::from_utf8(&output.stdout)?.trim().to_owned())
+}
+
 fn dataset_exists(dataset: &str) -> Result<bool> {
     Ok(Command::new("zfs")
         .args(["list", dataset])
@@ -283,7 +319,7 @@ fn dataset_prop(dataset: &str, property: &str) -> Result<Option<String>> {
         .args(["get", "-H", "-o", "value", property, dataset])
         .output()?;
     Ok(if output.status.success() {
-        Some(std::str::from_utf8(&output.stdout)?.trim().to_owned())
+        Some(trim_stdout(&output)?)
     } else {
         None
     })
@@ -293,6 +329,8 @@ fn dataset_prop(dataset: &str, property: &str) -> Result<Option<String>> {
 struct FrontMatter {
     name: String,
     dependencies: HashMap<String, Dependency>,
+    #[serde(default)]
+    skip_clone: bool,
 }
 
 #[derive(Debug, Deserialize)]

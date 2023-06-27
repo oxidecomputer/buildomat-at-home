@@ -4,6 +4,7 @@
     clippy::uninlined_format_args, // rust-lang/rust-analyzer#11260
 )]
 
+mod command;
 mod input;
 mod plan;
 mod step;

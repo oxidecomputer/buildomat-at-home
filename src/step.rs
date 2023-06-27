@@ -1,11 +1,10 @@
-use crate::{input::Input, JOB_NAME_PROPERTY};
-use anyhow::{ensure, Result};
+use crate::{command::CommandExt, input::Input, JOB_NAME_PROPERTY};
+use anyhow::Result;
 use camino::Utf8PathBuf;
 use dialoguer::console::style;
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::Client;
-use std::ffi::OsStr;
 use std::process::{Command, Stdio};
 use tempfile::NamedTempFile;
 use tokio::io::AsyncWriteExt;
@@ -13,6 +12,11 @@ use tokio::io::AsyncWriteExt;
 #[derive(Debug)]
 pub(crate) enum Step {
     Comment(String),
+    CloneRepo {
+        src: Utf8PathBuf,
+        treeish: String,
+        dest: Utf8PathBuf,
+    },
     CreateDataset {
         dataset: String,
         // `None` here means to inherit the mountpoint property
@@ -48,19 +52,32 @@ pub(crate) enum Step {
 
 impl Step {
     fn commands(&self) -> Vec<Command> {
-        macro_rules! zfs {
-            ($($arg:expr),*) => {{
-                let mut command = Command::new("pfexec");
-                command.arg("zfs");
+        macro_rules! cmd {
+            ($prog:expr, $($arg:expr),*) => {{
+                let mut command = Command::new($prog);
                 $(
                     command.arg($arg);
                 )*
                 command
-            }};
+            }}
+        }
+
+        macro_rules! zfs {
+            ($($arg:expr),*) => {
+                cmd!["pfexec", "zfs", $($arg),*]
+            };
         }
 
         match self {
             Step::Comment(_) | Step::DownloadArtefacts(_) => Vec::new(),
+            Step::CloneRepo { src, treeish, dest } => {
+                vec![
+                    cmd!["git", "-C", dest, "init"],
+                    cmd!["git", "-C", dest, "remote", "add", "origin", src],
+                    cmd!["git", "-C", dest, "fetch", "origin", treeish],
+                    cmd!["git", "-C", dest, "checkout", treeish],
+                ]
+            }
             Step::CreateDataset {
                 dataset,
                 mountpoint,
@@ -80,9 +97,7 @@ impl Step {
                 let mut commands = vec![create_cmd];
 
                 if let Some(mountpoint) = mountpoint {
-                    let mut chown_cmd = Command::new("pfexec");
-                    chown_cmd.arg("chown").arg(chown).arg(mountpoint);
-                    commands.push(chown_cmd);
+                    commands.push(cmd!["pfexec", "chown", chown, mountpoint]);
                 }
 
                 commands
@@ -92,8 +107,7 @@ impl Step {
                 vec![zfs!["inherit", "mountpoint", dataset]]
             }
             Step::RunScript { script, workdir } => {
-                let mut command = Command::new("/bin/bash");
-                command.arg(script);
+                let mut command = cmd!["/bin/bash", script];
                 command.env_clear();
                 command.current_dir(workdir);
                 command.stdin(Stdio::null());
@@ -140,12 +154,15 @@ impl Step {
             _ => self
                 .commands()
                 .into_iter()
-                .map(|command| command_to_str(&command))
+                .map(|command| command.to_string())
                 .collect(),
         }
     }
 
     pub(crate) async fn run(&self, client: &Client) -> Result<()> {
+        if let Step::CloneRepo { dest, .. } = self {
+            std::fs::create_dir_all(dest)?;
+        };
         if let Step::DownloadArtefacts(artefacts) = self {
             eprintln!(
                 "{} downloading {} artefacts to /input",
@@ -170,13 +187,11 @@ impl Step {
                 .buffer_unordered(4)
                 .try_collect::<()>()
                 .await?;
-        } else {
-            for mut command in self.commands() {
-                let command_str = command_to_str(&command);
-                eprintln!("{} {}", style("==>").blue(), command_str);
-                let status = command.status()?;
-                ensure!(status.success(), "`{}` failed with {}", command_str, status);
-            }
+        }
+
+        for mut command in self.commands() {
+            eprintln!("{} {}", style("==>").blue(), command.to_string());
+            command.succeed()?;
         }
 
         if let Step::SaveWorkAsInput { input, .. } = self {
@@ -189,14 +204,6 @@ impl Step {
 
         Ok(())
     }
-}
-
-fn command_to_str(command: &Command) -> String {
-    shell_words::join(
-        std::iter::once(command.get_program())
-            .chain(command.get_args())
-            .map(OsStr::to_string_lossy),
-    )
 }
 
 #[derive(Debug)]
