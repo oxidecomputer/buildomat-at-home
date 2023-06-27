@@ -5,6 +5,9 @@ edition = "2021"
 license = "MPL-2.0"
 publish = false
 
+[profile.release]
+debug = 1
+
 [dependencies]
 anyhow = { version = "1.0.71", features = ["backtrace"] }
 camino = "1.1.4"
