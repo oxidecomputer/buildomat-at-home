@@ -103,7 +103,11 @@ impl Plan {
 
         // Phase 2: Set up input mounts and download artifacts
 
-        let mut unmatched = frontmatter.dependencies.keys().collect::<HashSet<_>>();
+        let mut unmatched = frontmatter
+            .dependencies
+            .values()
+            .map(|v| &v.job)
+            .collect::<HashSet<_>>();
         let mut cleanup_phase = Vec::new();
         let mut mount_phase = Vec::new();
         let mut readonly_phase = Vec::new();
@@ -140,7 +144,7 @@ impl Plan {
                 .iter()
                 .find(|(_, v)| v.job == job_name)
             {
-                unmatched.remove(k);
+                unmatched.remove(&job_name);
                 k
             } else {
                 bail!("{} is not an input to this job", input);
