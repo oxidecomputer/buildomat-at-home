@@ -149,7 +149,10 @@ impl Plan {
                 bail!("{} is not an input to this job", input);
             };
 
-            let mountpoint = Utf8Path::new("/input").join(k);
+            let mut mountpoint = Utf8Path::new("/input").join(k);
+            if let Input::LocalBuild { .. } = input {
+                mountpoint.push("work");
+            }
             if let Some(check) = check {
                 let download = if dataset_exists(&dataset)? {
                     // If `readonly=off`, a previous run was most likely interrupted (since we set
