@@ -1,0 +1,22 @@
+[package]
+name = "buildomat-at-home"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+publish = false
+
+[dependencies]
+anyhow = { version = "1.0.71", features = ["backtrace"] }
+camino = "1.1.4"
+comrak = { version = "0.18.0", default-features = false }
+dialoguer = { version = "0.10.4", default-features = false }
+futures-util = { version = "0.3.28", default-features = false, features = ["std"] }
+indicatif = "0.17.5"
+parse-display = "0.8.1"
+reqwest = { version = "0.11.18", features = ["json"] }
+serde = { version = "1.0.164", features = ["derive"] }
+shell-words = "1.1.0"
+tempfile = "3.6.0"
+tokio = { version = "1.28.2", features = ["macros", "rt-multi-thread", "fs"] }
+toml = { version = "0.7.5", default-features = false, features = ["parse"] }
+ulid = { version = "1.0.0", features = ["serde"] }
