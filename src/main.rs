@@ -1,6 +1,7 @@
 #![warn(clippy::pedantic)]
 #![allow(
     clippy::manual_let_else, // rust-lang/rustfmt#4914
+    clippy::too_many_lines,
     clippy::uninlined_format_args, // rust-lang/rust-analyzer#11260
 )]
 

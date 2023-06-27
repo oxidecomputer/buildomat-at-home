@@ -16,7 +16,6 @@ use ulid::Ulid;
 pub(crate) struct Plan(pub(crate) Vec<Step>);
 
 impl Plan {
-    #[allow(clippy::too_many_lines)]
     pub(crate) async fn build(
         client: &Client,
         script: &Utf8Path,
@@ -272,6 +271,7 @@ impl Plan {
         plan.push(Step::RunScript {
             script: script.to_owned(),
             workdir,
+            rust_toolchain: frontmatter.rust_toolchain,
         });
 
         // Phase 4: Clone and promote /work
@@ -334,6 +334,8 @@ struct FrontMatter {
     name: String,
     #[serde(default)]
     dependencies: HashMap<String, Dependency>,
+    #[serde(default)]
+    rust_toolchain: Option<String>,
     #[serde(default)]
     skip_clone: bool,
 }

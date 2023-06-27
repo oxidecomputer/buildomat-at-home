@@ -34,6 +34,7 @@ pub(crate) enum Step {
     RunScript {
         script: Utf8PathBuf,
         workdir: Utf8PathBuf,
+        rust_toolchain: Option<String>,
     },
     SaveWorkAsInput {
         work_dataset: String,
@@ -106,11 +107,45 @@ impl Step {
             Step::InheritDatasetMountpoint { dataset } => {
                 vec![zfs!["inherit", "mountpoint", dataset]]
             }
-            Step::RunScript { script, workdir } => {
+            Step::RunScript {
+                script,
+                workdir,
+                rust_toolchain,
+            } => {
                 let mut command = cmd!["/bin/bash", script];
-                command.env_clear();
                 command.current_dir(workdir);
                 command.stdin(Stdio::null());
+
+                // https://github.com/oxidecomputer/buildomat/blob/4ae0dc9fc1e6e300bba9f959ce264aad2754cdbd/github/server/src/variety/basic.rs#L689
+                command.env_clear();
+                if let Some(home) = std::env::var_os("HOME") {
+                    command.env("HOME", &home);
+
+                    let mut path = home;
+                    path.push("/.cargo/bin");
+                    for dir in [
+                        "/usr/bin",
+                        "/bin",
+                        "/usr/sbin",
+                        "/sbin",
+                        "/opt/ooce/bin",
+                        "/opt/ooce/sbin",
+                    ] {
+                        path.push(":");
+                        path.push(dir);
+                    }
+                    command.env("PATH", path);
+                }
+                for var in ["HOME", "USER", "LOGNAME", "PATH"] {
+                    if let Some(value) = std::env::var_os(var) {
+                        command.env(var, value);
+                    }
+                }
+
+                if let Some(version) = rust_toolchain {
+                    command.env("RUSTUP_TOOLCHAIN", version);
+                }
+
                 vec![command]
             }
             Step::SaveWorkAsInput {
