@@ -151,7 +151,7 @@ impl Plan {
 
             let mountpoint = Utf8Path::new("/input").join(k);
             if let Some(check) = check {
-                if dataset_exists(&dataset)? {
+                let download = if dataset_exists(&dataset)? {
                     // If `readonly=off`, a previous run was most likely interrupted (since we set
                     // `readonly=on`) after successfully downloading everything.
                     if dataset_prop(&dataset, "readonly")?.as_deref() == Some("off") {
@@ -159,34 +159,39 @@ impl Plan {
                         cleanup_phase.push(Step::DestroyDataset {
                             dataset: dataset.clone(),
                         });
+                        true
                     } else {
-                        // The input dataset exists and looks fine. Adjust the mountpoint if needed,
-                        // but otherwise continue as we do not need to download these artefacts.
-                        if mounted.get(&dataset) == Some(&mountpoint) {
-                            mounted.remove(&dataset);
-                        } else {
-                            mount_phase.push(Step::SetDatasetMountpoint {
-                                dataset: dataset.clone(),
-                                mountpoint,
-                            });
-                        }
-                        continue;
+                        false
                     }
-                }
-
-                for (path, url) in check.artefacts() {
-                    downloads.push(DownloadArtefact {
-                        path: format!("{}{}", mountpoint, path).into(),
-                        url,
+                } else {
+                    true
+                };
+                if download {
+                    for (path, url) in check.artefacts() {
+                        downloads.push(DownloadArtefact {
+                            path: format!("{}{}", mountpoint, path).into(),
+                            url,
+                        });
+                    }
+                    mount_phase.push(Step::CreateDataset {
+                        dataset: dataset.clone(),
+                        mountpoint: Some(mountpoint.clone()),
+                        create_parents: true,
+                        chown: chown.clone(),
+                    });
+                    readonly_phase.push(Step::SetDatasetReadOnly {
+                        dataset: dataset.clone(),
                     });
                 }
-                mount_phase.push(Step::CreateDataset {
+            }
+
+            if mounted.get(&dataset) == Some(&mountpoint) {
+                mounted.remove(&dataset);
+            } else {
+                mount_phase.push(Step::SetDatasetMountpoint {
                     dataset: dataset.clone(),
-                    mountpoint: Some(mountpoint),
-                    create_parents: true,
-                    chown: chown.clone(),
+                    mountpoint,
                 });
-                readonly_phase.push(Step::SetDatasetReadOnly { dataset });
             }
         }
         ensure!(
