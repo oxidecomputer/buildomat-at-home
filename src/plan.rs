@@ -332,6 +332,7 @@ fn dataset_prop(dataset: &str, property: &str) -> Result<Option<String>> {
 #[derive(Debug, Deserialize)]
 struct FrontMatter {
     name: String,
+    #[serde(default)]
     dependencies: HashMap<String, Dependency>,
     #[serde(default)]
     skip_clone: bool,
