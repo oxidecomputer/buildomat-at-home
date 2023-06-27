@@ -118,34 +118,29 @@ impl Step {
 
                 // https://github.com/oxidecomputer/buildomat/blob/4ae0dc9fc1e6e300bba9f959ce264aad2754cdbd/github/server/src/variety/basic.rs#L689
                 command.env_clear();
-                if let Some(home) = std::env::var_os("HOME") {
-                    command.env("HOME", &home);
-
-                    let mut path = home;
-                    path.push("/.cargo/bin");
-                    for dir in [
-                        "/usr/bin",
-                        "/bin",
-                        "/usr/sbin",
-                        "/sbin",
-                        "/opt/ooce/bin",
-                        "/opt/ooce/sbin",
-                    ] {
-                        path.push(":");
-                        path.push(dir);
-                    }
-                    command.env("PATH", path);
-                }
-                for var in ["HOME", "USER", "LOGNAME", "PATH"] {
+                for var in ["HOME", "USER", "LOGNAME"] {
                     if let Some(value) = std::env::var_os(var) {
                         command.env(var, value);
                     }
                 }
 
+                let mut path = vec![
+                    "/usr/bin".to_owned(),
+                    "/bin".to_owned(),
+                    "/usr/sbin".to_owned(),
+                    "/sbin".to_owned(),
+                    "/opt/ooce/bin".to_owned(),
+                    "/opt/ooce/sbin".to_owned(),
+                ];
+
                 if let Some(version) = rust_toolchain {
                     command.env("RUSTUP_TOOLCHAIN", version);
+                    if let Ok(home) = std::env::var("HOME") {
+                        path.insert(0, format!("{}/.cargo/bin", home));
+                    }
                 }
 
+                command.env("PATH", path.join(":"));
                 vec![command]
             }
             Step::SaveWorkAsInput {
